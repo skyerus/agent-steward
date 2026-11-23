@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for newly authorised Discord server installations
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=10s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

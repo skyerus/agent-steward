@@ -1,0 +1,595 @@
+import { readFileSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import process from "node:process";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ConnectionError, Registry } from "./registry.mjs";
+import { RemoteConnectors } from "./remote.mjs";
+import { isBrowserId, newBrowserId, pairingCookie } from "./browser-pairing.mjs";
+import { Access, actorField, adminAgent, agentIdPattern, requireAccess, validActor } from "./access.mjs";
+import { unixRequest } from "./unix-request.mjs";
+import { githubMcpEndpoint } from "./github-registration.mjs";
+import { githubInstallation, GithubGit, installationTools } from "./github-native.mjs";
+
+const knownLegacy = Object.freeze({
+  gmail: "Gmail",
+  "freeagent-sable": "FreeAgent",
+  netlify: "Netlify",
+  "supabase-cms": "Supabase CMS",
+});
+const legacy = Object.fromEntries((process.env.SABLE_LEGACY_CONNECTIONS ?? "").split(",")
+  .filter(name => Object.hasOwn(knownLegacy, name))
+  .map(name => [name, knownLegacy[name]]));
+const identity = { name: "sable-integration-broker", version: "1.0.0" };
+const registry = new Registry(process.argv[2], legacy);
+registry.migrateLegacyAccess(JSON.parse(process.env.SABLE_LEGACY_GRANTS ?? "{}"));
+const access = new Access(registry, user => provision("discord_is_admin", {}, user));
+const credentialDir = process.env.CREDENTIALS_DIRECTORY;
+const clients = credentialDir ? JSON.parse(readFileSync(join(credentialDir, "oauth-clients.json"), "utf8")) : [];
+const remote = new RemoteConnectors(registry, { origin: process.env.SABLE_SIGN_IN_ORIGIN, clients });
+const signInHost = new URL(remote.origin).host;
+const queues = new Map();
+const githubGitEnabled = process.env.SABLE_NATIVE_GIT === "1";
+const gitAccess = new GithubGit({
+  checkGrant: async ({ actor, id, revision }) => {
+    requireAccess(await access.snapshot(actor), id, "use");
+    return registry.get(id, revision);
+  },
+});
+
+function serialized(id, work) {
+  const previous = queues.get(id) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  queues.set(id, next);
+  return next.finally(() => {
+    if (queues.get(id) === next) queues.delete(id);
+  });
+}
+
+const id = { type: "string", minLength: 1, maxLength: 64, description: "Connection ID from list_connections." };
+const revision = { type: "integer", minimum: 1, description: "Destination revision from list_connections." };
+const label = { type: "string", minLength: 1, maxLength: 100 };
+const endpoint = { type: "string", maxLength: 2048, description: "Public HTTPS OAuth MCP endpoint." };
+const name = { type: "string", minLength: 1, maxLength: 100 };
+const agentId = { type: "string", minLength: 1, maxLength: 63, pattern: agentIdPattern.source };
+const channelId = { type: "string", minLength: 16, maxLength: 22, pattern: "^[0-9]{16,22}$" };
+const discordUsers = { type: "array", maxItems: 100, items: name };
+const instructions = { type: "string", minLength: 1, maxLength: 12_000 };
+const requestId = { type: "string", minLength: 32, maxLength: 32, pattern: "^[0-9a-f]{32}$" };
+const callArguments = { type: "object" };
+
+function tool(name, description, properties = {}, required = Object.keys(properties)) {
+  return { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false } };
+}
+
+const management = [
+  tool("list_connections", "Read current integration names, IDs, destination revisions, and sign-in status."),
+  tool("diagnose_connection", "Read safe sign-in diagnostics for an accessible connection. Discover its supported onboarding method or set verify to check a connected MCP server without running a provider tool.", {
+    id, revision, verify: { type: "boolean" },
+  }, ["id", "revision"]),
+  tool("add_connection", "Create a disconnected integration for yourself. Integration Admin can optionally set the owning agent.", { label, endpoint, agentId }, ["label", "endpoint"]),
+  tool("edit_connection", "Rename an integration or replace its destination. Replacing the destination invalidates its credential and requires a fresh sign-in.", { id, revision, label, endpoint }, ["id", "revision"]),
+  tool("delete_connection", "Remove an integration and prevent its credential from being used by the broker.", { id, revision }),
+  tool("begin_sign_in", "Create a one-time browser sign-in link for a disconnected integration. Give the link to the requester.", { id, revision }),
+  tool("begin_oauth_client_setup", "Start paired browser setup for a connection you manage that needs a registered OAuth client. The broker handles all credentials. For GitHub, access sets repository permissions and organization selects the app owner if specified.", {
+    id, revision,
+    organization: { type: "string", maxLength: 39, pattern: "^[a-zA-Z0-9][a-zA-Z0-9-]*$" },
+    access: { type: "string", maxLength: 5, pattern: "^(read|write)$" },
+  }, ["id", "revision"]),
+  tool("confirm_sign_in", "Pair the requester's browser using the eight-digit code the requester just sent in Discord.", { id, revision,
+    code: { type: "string", minLength: 8, maxLength: 8, pattern: "^[0-9]{8}$" } }),
+  tool("list_connection_tools", "Read the tool names and schemas exposed by a connected remote MCP server.", { id, revision }),
+  tool("call_connection_tool", "Run the named tool with these arguments on this integration and destination revision.", { id, revision, name, arguments: callArguments }),
+  ...(githubGitEnabled ? [
+    tool("begin_github_installation",
+      "Integration Admin only. Start paired registration of a private GitHub App for native Git and GitHub MCP. The account owner installs it on all repositories of the named account and verifies in the paired browser. Registration keeps the signing key in the broker. Use only the explicitly requested read or write permissions.",
+      { id, revision, account: { type: "string", maxLength: 39, pattern: "^[a-z0-9][a-z0-9-]*$" },
+        access: { type: "string", maxLength: 5, pattern: "^(read|write)$" },
+        organization: { type: "boolean" } }, ["id", "revision", "account", "access"]),
+    tool("authorize_git_read",
+      "Clone or fetch a GitHub repository through native Git. Returns an expiring Git permit and remote for the approved repository.",
+      { id, revision, repository: { type: "string", minLength: 3, maxLength: 140 } }),
+    tool("authorize_git_push",
+      "Push one explicit Git branch or tag update. Review the exact ref and before and after commit IDs. A push may replace history. Forty zeroes as oldCommit means creating a new ref.",
+      { id, revision, repository: { type: "string", minLength: 3, maxLength: 140 },
+        ref: { type: "string", minLength: 11, maxLength: 255 },
+        oldCommit: { type: "string", maxLength: 40, pattern: "^[0-9a-f]{40}$" },
+        newCommit: { type: "string", maxLength: 40, pattern: "^[0-9a-f]{40}$" } }),
+  ] : []),
+  tool("list_connection_access", "Integration Admin only. See which agents can use a connection.", { id, revision }),
+  tool("grant_connection_access", "Integration Admin only. Share one connection with another agent.", { id, revision, agentId }),
+  tool("revoke_connection_access", "Integration Admin only. Remove an agent's access to one connection.", { id, revision, agentId }),
+  tool("list_managed_agents", "Integration Admin only. Read the configured agents and their Discord bindings."),
+  tool("create_agent", "Integration Admin only. Create a downstream agent with an empty, isolated workspace and no account access.", { agentId, name }),
+  tool("rename_agent", "Integration Admin only. Change a downstream agent's display name.", { agentId, name }),
+  tool("set_agent_instructions", "Integration Admin only. Replace a downstream agent's AGENTS.md with its approved role and operating instructions.", { agentId, instructions }),
+  tool("deploy_agent_connector",
+    "Integration Admin only. Install or replace one reviewed connector source file in a downstream agent's native workspace. It runs only as an ordinary workspace program and all integration calls still go through the broker. Supply source code without credentials.",
+    { agentId, filename: { type: "string", maxLength: 85, pattern: "^[a-z0-9][a-z0-9_-]{0,62}\\.(py|mjs|sh)$" },
+      source: { type: "string", minLength: 1, maxLength: 12000 } }),
+  tool("bind_agent_channel", "Integration Admin only. Route an existing approved private Discord channel to a downstream agent.", { agentId, channelId }),
+  tool("prepare_discord_server", "Integration Admin only. Prepare an official Discord install link for a named server or server ID. Once installation is verified, create private channels for the specified existing agents and allow only the designated users. The requester is always included.", {
+    server: name,
+    agentIds: { type: "array", minItems: 1, maxItems: 20, items: agentId },
+    allowedUsers: { type: "array", maxItems: 24, items: channelId },
+    voice: { type: "boolean" },
+  }, ["server", "agentIds"]),
+  tool("discord_server_setup_status", "Integration Admin only. Read current progress and the Discord install link for a server setup request.", { requestId }),
+  tool("cancel_discord_server_setup", "Integration Admin only. Stop a pending Discord server setup before further provisioning.", { requestId }),
+  tool("list_discord_access", "Integration Admin only. List who can message the bot in each configured text channel and which agents users can DM."),
+  tool("update_discord_channel_access", "Integration Admin only. Change who the bot accepts messages from in an existing text channel. Use its name, ID or mention. Add or remove named users, IDs or mentions, or give the complete allowlist with onlyUsers. An empty onlyUsers disables the bot in the channel. Discord room visibility is managed separately.", {
+    channel: name, addUsers: discordUsers, removeUsers: discordUsers, onlyUsers: discordUsers,
+  }, ["channel"]),
+  tool("update_discord_dm_access", "Integration Admin only. Assign a Discord user to a specific agent in DMs, or revoke their DM access. Routing a user to integration-admin gives them administrator privileges.", {
+    user: name, agentId, revoke: { type: "boolean" },
+  }, ["user"]),
+];
+const byName = new Map(management.map(value => [value.name, value]));
+
+class ToolInputError extends ConnectionError {}
+
+function validInput(value, schema) {
+  switch (schema.type) {
+    case "string":
+      return typeof value === "string" && value.trim().length >= (schema.minLength ?? 1) && value.length <= schema.maxLength &&
+        (!schema.pattern || new RegExp(schema.pattern).test(value));
+    case "integer":
+      return Number.isSafeInteger(value) && value >= schema.minimum;
+    case "boolean":
+      return typeof value === "boolean";
+    case "array":
+      return Array.isArray(value) && value.length >= (schema.minItems ?? 0) && value.length <= schema.maxItems &&
+        value.every(item => validInput(item, schema.items));
+    case "object":
+      return value && typeof value === "object" && !Array.isArray(value);
+  }
+}
+
+function validateFields(schema, fields, values) {
+  const missing = schema.required.filter(key => !fields.includes(key));
+  if (missing.length) throw new ToolInputError(`Missing required tool arguments: ${missing.join(", ")}.`);
+  if (fields.some(key => !Object.hasOwn(schema.properties, key))) {
+    throw new ToolInputError("Unexpected tool arguments. Use the advertised input schema.");
+  }
+  for (const [key, value] of Object.entries(values)) {
+    if (!validInput(value, schema.properties[key])) throw new ToolInputError(`Invalid value for tool argument ${key}.`);
+  }
+}
+
+function validated(call) {
+  const definition = byName.get(call.name)?.inputSchema;
+  const { [actorField]: actor, ...args } = call.arguments ?? {};
+  if (!validActor(actor)) throw new ConnectionError("An authenticated Discord agent and requester are required.");
+  if (!definition) throw new ConnectionError("Unknown integration management tool.");
+  validateFields(definition, Object.keys(args), args);
+  return { args, actor };
+}
+
+const result = value => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
+const agentTools = new Set(["list_managed_agents", "create_agent", "rename_agent", "set_agent_instructions", "deploy_agent_connector", "bind_agent_channel",
+  "prepare_discord_server", "discord_server_setup_status", "cancel_discord_server_setup",
+  "list_discord_access", "update_discord_channel_access", "update_discord_dm_access"]);
+const sharingTools = new Set(["list_connection_access", "grant_connection_access", "revoke_connection_access"]);
+const usageTools = new Set(["list_connection_tools", "call_connection_tool", "authorize_git_read", "authorize_git_push"]);
+const permissionFor = name => sharingTools.has(name) ? "share" : usageTools.has(name) ? "use" : "manage";
+
+function requireConnectionCall(policy, id, name) {
+  if (name === "diagnose_connection" && policy.can(id, "use")) return;
+  if (name === "begin_github_installation") requireAccess(policy, id, "share");
+  requireAccess(policy, id, permissionFor(name));
+}
+
+async function provision(name, args, requester) {
+  try {
+    const output = await unixRequest("/run/sable-agent-provisioner.sock", { name, args, requester }, 45_000);
+    if (!output.ok) throw new ConnectionError(output.error);
+    return output.value;
+  } catch (error) {
+    if (error instanceof ConnectionError) throw error;
+    throw new ConnectionError("The agent provisioning service is unavailable.");
+  }
+}
+
+async function manage(call) {
+  const { args, actor } = validated(call);
+  if (call.name === "list_connections") {
+    const policy = await access.snapshot(actor);
+    return result(registry.list().filter(row => policy.can(row.id, "use") || policy.can(row.id, "manage")));
+  }
+  if (call.name === "add_connection") {
+    const policy = await access.snapshot(actor);
+    requireAccess(policy, "registry", "create");
+    let owner = actor.agent;
+    if (actor.agent === adminAgent || args.agentId !== undefined && args.agentId !== actor.agent) {
+      requireAccess(policy, "agents", "agents");
+      const agents = args.agentId ? await provision("list_managed_agents", {}) : [];
+      if (args.agentId && !agents.some(entry => entry.id === args.agentId)) {
+        throw new ConnectionError("The target agent does not exist.");
+      }
+      owner = args.agentId ?? null;
+    }
+    return result(registry.add(args.label, args.endpoint, owner));
+  }
+  if (agentTools.has(call.name)) {
+    requireAccess(await access.snapshot(actor), "agents", "agents");
+    return result(await provision(call.name, args, actor.user));
+  }
+  return serialized(args.id, async () => {
+    requireConnectionCall(await access.snapshot(actor), args.id, call.name);
+    const row = registry.get(args.id, args.revision);
+    switch (call.name) {
+      case "diagnose_connection":
+        {
+          const installation = githubInstallation(row);
+          if (!installation) return result(await remote.diagnose(row, args.verify));
+          if (args.verify) await installationTools(row, installation);
+          return result({ status: "connected", authentication: "github_app_installation",
+            ...(installation.account ? { account: installation.account } : { repository: installation.repository }),
+            git: githubGitEnabled, verified: Boolean(args.verify) });
+        }
+      case "authorize_git_read":
+        return result(gitAccess.open(row, actor, args.repository));
+      case "authorize_git_push":
+        return result(gitAccess.open(row, actor, args.repository, {
+          ref: args.ref, oldCommit: args.oldCommit, newCommit: args.newCommit,
+        }));
+      case "edit_connection": {
+        const edited = registry.edit(args.id, args.revision, args);
+        if (edited.revision !== row.revision) remote.prune(row);
+        return result(edited);
+      }
+      case "delete_connection":
+        registry.delete(args.id, args.revision);
+        remote.prune(row);
+        return result({ deleted: args.id });
+      case "begin_sign_in":
+        return result(remote.begin(row, actor.user, actor));
+      case "begin_github_installation": {
+        if (row.endpoint !== githubMcpEndpoint || row.owner_agent !== adminAgent || row.legacy || row.credential) {
+          throw new ConnectionError("Use a disconnected official GitHub MCP connection owned by Integration Admin.");
+        }
+        const { account, access: mode, organization } = args;
+        return result(remote.begin(row, actor.user, actor, { method: "github_installation", account,
+          organization: organization ? account : undefined, access: mode }));
+      }
+      case "begin_oauth_client_setup":
+        return result(await remote.beginClientSetup(row, actor.user, actor, args));
+      case "confirm_sign_in":
+        remote.confirm(row, actor.user, args.code, actor);
+        return result({ browser_verified: true });
+      case "list_connection_access":
+        return result(registry.grants(row.id).map(grant => grant.agent));
+      case "grant_connection_access": {
+        const agents = await provision("list_managed_agents", {});
+        if (!agents.some(agent => agent.id === args.agentId)) throw new ConnectionError("The target agent does not exist.");
+        if (!row.legacy && !row.credential) throw new ConnectionError("Connect this account before sharing it.");
+        registry.grant(row.id, args.agentId);
+        return result({ connection: row.id, agent: args.agentId, access: "use" });
+      }
+      case "revoke_connection_access":
+        registry.revoke(row.id, args.agentId);
+        return result({ connection: row.id, agent: args.agentId, access: "revoked" });
+      case "list_connection_tools":
+      case "call_connection_tool":
+        if (row.legacy && !Object.hasOwn(legacy, row.id)) throw new ConnectionError("This connection has no configured connector.");
+        const invoke = call.name === "call_connection_tool" ? { name: args.name, arguments: args.arguments } : undefined;
+        const installation = githubInstallation(row);
+        const output = await (row.legacy ? withLegacy(row.id, invoke)
+          : installation ? installationTools(row, installation, invoke) : remote.tools(row, invoke));
+        return invoke ? output : result(output);
+    }
+  });
+}
+
+async function withLegacy(route, call) {
+  const transport = new StdioClientTransport({
+    command: "/usr/bin/socat", args: ["-", `UNIX-CONNECT:/run/sable-mcp-${route}.sock`], stderr: "ignore",
+  });
+  const client = new Client(identity);
+  const options = { timeout: 30_000 };
+  try {
+    await client.connect(transport, options);
+    return call ? await client.callTool(call, undefined, options) : await client.listTools({}, options);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+async function legacyTools(route, call) {
+  return serialized(route, async () => {
+    let providerCall;
+    if (call) {
+      const { [actorField]: actor, ...args } = call.arguments ?? {};
+      requireAccess(await access.snapshot(actor), route, "use");
+      providerCall = { ...call, arguments: args };
+    }
+    let row;
+    try { row = registry.get(route); } catch (error) {
+      if (!(error instanceof ConnectionError)) throw error;
+    }
+    if (!row?.legacy) {
+      if (!call) return { tools: [] };
+      throw new ConnectionError("The original integration is disconnected. List connections for the current destination.");
+    }
+    return withLegacy(route, providerCall);
+  });
+}
+
+async function reviewTarget(payload) {
+  const { service, name, args, fields, actor } = payload;
+  const policy = await access.snapshot(actor);
+  if (Object.hasOwn(legacy, service)) {
+    requireAccess(policy, service, "use");
+    const row = registry.get(service);
+    if (!row.legacy) throw new ConnectionError("This connection's original destination is disconnected.");
+    return { connection: registry.describe(row) };
+  }
+  const definition = byName.get(name);
+  if (service !== "integrations" || !definition) throw new ConnectionError("Unknown integration route.");
+  validateFields(definition.inputSchema, fields, args);
+  const operation = { description: definition.description };
+  if (agentTools.has(name)) {
+    requireAccess(policy, "agents", "agents");
+    return { operation };
+  }
+  if (name === "add_connection" && args?.agentId !== undefined && args.agentId !== actor.agent) {
+    requireAccess(policy, "agents", "agents");
+  }
+  if (name === "list_connections" || name === "add_connection") return { operation };
+  const { id, revision } = args ?? {};
+  if (typeof id !== "string" || !Number.isSafeInteger(revision)) throw new ConnectionError("Invalid connection reference.");
+  requireConnectionCall(policy, id, name);
+  return { operation, connection: registry.describe(registry.get(id, revision)) };
+}
+
+function attachLocalRequest(socket, prefix, handler, maxBytes, visibleError = ToolInputError) {
+  let data = prefix;
+  function consume() {
+    const end = data.indexOf(10);
+    if (data.length > maxBytes) return socket.destroy();
+    if (end < 0) return;
+    socket.pause();
+    Promise.resolve().then(() => handler(JSON.parse(data.subarray(0, end).toString())))
+      .then(value => socket.end(JSON.stringify({ ok: true, value }) + "\n"))
+      .catch(error => socket.end(JSON.stringify({
+        ok: false,
+        ...(error instanceof visibleError && { inputError: error.message }),
+      }) + "\n"));
+  }
+  socket.on("data", chunk => { data = Buffer.concat([data, chunk]); consume(); });
+  if (prefix.length) consume();
+  if (data.indexOf(10) < 0) socket.resume();
+}
+
+function attach(socket, route, prefix) {
+  const input = new PassThrough();
+  socket.pipe(input);
+  const server = new Server(identity, { capabilities: { tools: {} } });
+  server.setRequestHandler(ListToolsRequestSchema, () =>
+    route === "integrations" ? { tools: management } : legacyTools(route));
+  server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+    try {
+      return await (route === "integrations" ? manage(params) : legacyTools(route, params));
+    } catch (error) {
+      const message = error instanceof ConnectionError ? error.message : "The broker could not complete the request.";
+      return { isError: true, content: [{ type: "text", text: message }] };
+    }
+  });
+  socket.on("close", () => { server.close().catch(() => {}); input.destroy(); });
+  server.connect(new StdioServerTransport(input, socket, { maxBufferSize: 256 * 1024 }))
+    .then(() => { if (prefix.length) input.write(prefix); socket.resume(); })
+    .catch(() => socket.destroy());
+}
+
+const listener = net.createServer(socket => {
+  socket.on("error", () => socket.destroy());
+  socket.setTimeout(5_000, () => socket.destroy());
+  let head = Buffer.alloc(0);
+  function onData(chunk) {
+    head = Buffer.concat([head, chunk]);
+    const newline = head.indexOf(10);
+    if (newline < 0 && head.length < 64) return;
+    const route = newline >= 0 && newline < 64 ? head.subarray(0, newline).toString("ascii") : "";
+    if (!["integrations", "review-target", "schedule"].includes(route) && !Object.hasOwn(legacy, route)) return socket.destroy();
+    socket.pause();
+    socket.off("data", onData);
+    socket.setTimeout(0);
+    const prefix = head.subarray(newline + 1);
+    if (route === "review-target") attachLocalRequest(socket, prefix, reviewTarget, 4096);
+    else if (route === "schedule") attachLocalRequest(socket, prefix,
+      payload => provision("manage_schedule", payload, payload.scope?.user), 65536, ConnectionError);
+    else attach(socket, route, prefix);
+  }
+  socket.on("data", onData);
+});
+
+if (process.env.LISTEN_PID !== String(process.pid) || process.env.LISTEN_FDS !== "1") {
+  throw new Error("The broker requires its systemd socket.");
+}
+listener.listen({ fd: 3 });
+
+const markup = text => String(text).replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+function page(response, status, body, headers = {}) {
+  response.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "X-Content-Type-Options": "nosniff",
+    ...headers,
+  });
+  response.end(`<!doctype html><meta charset="utf-8"><title>Agent Steward integrations</title>${body}`);
+}
+
+function pairedPage(pending) {
+  if (pending.githubApp) {
+    return { body: `<p><a href="${markup(pending.githubApp.installUrl)}" target="_blank" rel="noopener noreferrer">Install the app on GitHub</a>.
+      Select all repositories of <strong>${markup(pending.setup.account)}</strong> and grant ${markup(pending.setup.access)} access for code, issues and pull requests.
+      Then return to this paired tab.</p><form method="post"><button>Verify installation</button></form>` };
+  }
+  if (pending.setup?.method === "github_manifest" || pending.setup?.method === "github_installation") {
+    const manifest = remote.manifest(pending);
+    return {
+      body: `<p>Register the private app on GitHub. Then install it on the repositories you choose and authorise this connection.</p>
+        <form method="post" action="${markup(manifest.target)}">
+          <input type="hidden" name="manifest" value="${markup(JSON.stringify(manifest.data))}">
+          <button>Register GitHub App</button>
+        </form>`,
+      headers: {
+        "Content-Security-Policy": "default-src 'none'; form-action https://github.com; frame-ancestors 'none'; base-uri 'none'",
+      },
+    };
+  }
+  if (pending.setup?.method === "secure_client_intake") {
+    const issuer = markup(pending.setup.metadata.issuer);
+    const tokenEndpoint = markup(pending.setup.metadata.token_endpoint);
+    return {
+      body: `<p>Register a client with <code>${issuer}</code>. Set its callback to <code>${markup(remote.origin)}/oauth/callback</code>.
+        The broker will use these credentials only for the discovered token endpoint <code>${tokenEndpoint}</code>.</p>
+        <form method="post" autocomplete="off">
+          <p><label>Client ID <input name="client_id" maxlength="512" required></label></p>
+          <p><label>Client secret <input type="password" name="client_secret" maxlength="4096" required></label></p>
+          <p><label>Token endpoint authentication <select name="auth_method">
+            <option value="client_secret_post">Client secret in request body</option>
+            <option value="client_secret_basic">HTTP Basic authentication</option>
+          </select></label></p>
+          <button>Save directly to the broker</button>
+        </form>`,
+    };
+  }
+  const registration = remote.registeredClient(pending.row);
+  const install = registration?.installUrl
+    ? `<p><a href="${markup(registration.installUrl)}" target="_blank" rel="noopener noreferrer">Install the app on GitHub</a>
+      and choose the repositories it can access. Then return to this tab.</p>`
+    : "";
+  return { body: `${install}<form method="post"><button>Continue to provider sign-in</button></form>` };
+}
+
+async function clientForm(request) {
+  if (request.headers["content-type"]?.split(";")[0] !== "application/x-www-form-urlencoded") {
+    throw new ConnectionError("Use the broker's credential form.");
+  }
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 16_384) throw new ConnectionError("The credential form exceeds the size limit.");
+    chunks.push(chunk);
+  }
+  const form = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+  if (form.size !== 3 || ["client_id", "client_secret", "auth_method"].some(key => form.getAll(key).length !== 1)) {
+    throw new ConnectionError("The credential form is incomplete.");
+  }
+  return { clientId: form.get("client_id"), clientSecret: form.get("client_secret"), authMethod: form.get("auth_method") };
+}
+
+const browser = http.createServer(async (request, response) => {
+  const host = request.headers.host;
+  if (host !== signInHost || !request.url?.startsWith("/") ||
+      request.url.startsWith("//") || request.url.length > 8192) {
+    return page(response, 400, "<p>Invalid request.</p>");
+  }
+  let attempt;
+  try {
+    const url = new URL(request.url, remote.origin);
+    const cookies = (request.headers.cookie ?? "").split("; ").filter(item => item.startsWith(`${pairingCookie}=`));
+    const browserId = cookies.length === 1 ? cookies[0].slice(pairingCookie.length + 1) : undefined;
+    const link = /^\/connect\/([\w-]{43})$/.exec(url.pathname)?.[1];
+    if (link && request.method === "GET") {
+      const pending = remote.pending(link);
+      const { row, pairing } = pending;
+      const id = isBrowserId(browserId) ? browserId : newBrowserId();
+      const code = pairing.codeFor(id);
+      const confirmed = pairing.canContinue(id);
+      const paired = confirmed ? pairedPage(pending) : undefined;
+      const next = paired ? paired.body
+        : code
+          ? `<p>Send this code to the agent in Discord.</p><p><strong>${code}</strong></p>
+             <p>Return here after the agent confirms the code.</p><p><a href="/connect/${link}">Check confirmation</a></p>`
+          : "<p>This link is paired with another browser. Ask the agent for a fresh link.</p>";
+      return page(response, 200, `<h1>Connect ${markup(row.label)}</h1>
+        <p>Integration endpoint <code>${markup(row.endpoint)}</code></p>${next}`,
+        {
+          "Set-Cookie": `${pairingCookie}=${id}; Max-Age=600; Path=/; Secure; HttpOnly; SameSite=Lax`,
+          ...(paired && { "Referrer-Policy": "same-origin", ...paired.headers }),
+        });
+    }
+    if (link && request.method === "POST") {
+      if (request.headers.origin !== remote.origin) {
+        return page(response, 403, "<p>Submit this form from the original sign-in tab.</p>");
+      }
+      const pending = remote.pending(link);
+      const authorization = await serialized(pending.row.id, async () => {
+        const current = remote.pending(link);
+        requireAccess(await access.snapshot(current.actor), current.row.id, "manage");
+        if (!current.pairing.canContinue(browserId)) throw new ConnectionError("Confirm this browser in Discord first.");
+        attempt = current.row;
+        if (current.setup?.method === "github_installation") {
+          requireAccess(await access.snapshot(current.actor), current.row.id, "share");
+          await remote.finishGitHubInstallation(current);
+          return false;
+        }
+        if (current.setup) {
+          if (current.setup.method !== "secure_client_intake") throw new ConnectionError("Register the app on GitHub first.");
+          remote.saveRegistration(current, await clientForm(request));
+          return undefined;
+        }
+        return remote.authorize(current);
+      });
+      if (authorization === false) {
+        return page(response, 200, "<h1>GitHub connected</h1><p>You can return to Discord.</p>");
+      }
+      if (!authorization) {
+        return page(response, 200, `<p>OAuth client saved. <a href="/connect/${link}">Continue to sign-in</a>.</p>`);
+      }
+      // Keep the form submission same-origin. Some browsers apply form-action to HTTP redirects.
+      const destination = markup(authorization.href);
+      return page(response, 200, `<meta http-equiv="refresh" content="0;url=${destination}">
+        <p>Opening the provider sign-in. <a href="${destination}">Continue if it does not open automatically</a>.</p>`);
+    }
+    if (url.pathname === "/oauth/callback" && request.method === "GET") {
+      const params = url.searchParams;
+      const state = params.get("state");
+      const code = params.get("code");
+      const registration = remote.registrationStates.get(state);
+      const pending = registration ?? remote.states.get(state);
+      if (!pending?.pairing.canContinue(browserId) || params.getAll("state").length !== 1 ||
+          params.getAll("code").length > 1 || params.getAll("iss").length > 1) {
+        throw new ConnectionError("Invalid or expired sign-in. Request a new link.");
+      }
+      attempt = pending.row;
+      if (!code || params.has("error")) throw new ConnectionError("The provider declined or cancelled sign-in.");
+      await serialized(pending.row.id, async () => {
+        requireAccess(await access.snapshot(pending.actor), pending.row.id, "manage");
+        if (registration) {
+          if (pending.setup?.method === "github_installation") {
+            requireAccess(await access.snapshot(pending.actor), pending.row.id, "share");
+          }
+          return remote.finishManifest(pending, state, code);
+        }
+        return remote.finish(pending, state, params.get("iss"), code);
+      });
+      if (registration) {
+        return page(response, 200, `<p>GitHub App registered. <a href="/connect/${pending.link}">Continue to installation and sign-in</a>.</p>`);
+      }
+      return page(response, 200, "<h1>Connected</h1><p>You can return to Discord.</p>");
+    }
+    page(response, 404, "<p>Page unavailable.</p>");
+  } catch (error) {
+    const message = error instanceof ConnectionError ? error.message : "The provider could not finish sign-in.";
+    if (attempt) remote.record(attempt, "sign_in_error", message);
+    if (!(error instanceof ConnectionError)) {
+      const code = [error?.code, error?.cause?.code].find(value => typeof value === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(value));
+      const location = /(?:lifecycle\/)([a-z-]+\.mjs:\d+:\d+)/.exec(error?.stack ?? "")?.[1];
+      console.warn("Integration browser request failed", { method: request.method, code, location });
+    }
+    page(response, 400, `<p>${markup(message)}</p>`);
+  }
+});
+browser.listen(17896, "127.0.0.1");
+if (githubGitEnabled) gitAccess.server().listen(17897, "127.0.0.1");

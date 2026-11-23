@@ -1,0 +1,24 @@
+[Unit]
+Description=Create a workspace for an isolated native agent
+
+[Service]
+StandardInput=socket
+StandardOutput=null
+StandardError=journal
+ExecStart=/usr/bin/python3 /opt/sable/integrations/lifecycle/native-workspace.py
+RuntimeMaxSec=8
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ReadWritePaths=/var/lib/sable-codex/workspaces
+InaccessiblePaths=-/var/lib/sable-claw -/var/lib/sable-connection-broker -/etc/sable-claw -/run/sable-review
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID

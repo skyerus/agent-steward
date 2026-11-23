@@ -1,0 +1,23 @@
+[Unit]
+Description=Agent Steward integration credential broker
+Requires=sable-connection-broker.socket
+After=sable-connection-broker.socket
+
+[Service]
+User=sable-broker
+Group=sable-broker
+SupplementaryGroups=sable-reviewed
+LoadCredential=oauth-clients.json:/etc/sable-connection-broker/oauth-clients.json
+ExecStart=/opt/sable/node/bin/node /opt/sable/integrations/lifecycle/broker.mjs /var/lib/sable-connection-broker/connections.sqlite
+StateDirectory=sable-connection-broker
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+InaccessiblePaths=/var/lib/sable-claw /var/lib/sable-integrations /var/lib/sable-shell /var/lib/sable-workload -/run/docker.sock
+# Node uses netlink to enumerate local addresses for outbound destination checks.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

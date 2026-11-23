@@ -1,0 +1,13 @@
+[Unit]
+Description=Private socket for managed OpenClaw agents
+
+[Socket]
+ListenStream=/run/sable-agent-provisioner.sock
+SocketUser=sable-broker
+SocketGroup=sable-broker
+SocketMode=0660
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Private native agent workspace provisioning socket
+
+[Socket]
+ListenStream=/run/sable-native-workspace.sock
+SocketUser=sable-claw
+SocketGroup=sable-claw
+SocketMode=0600
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

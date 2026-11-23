@@ -1,0 +1,25 @@
+[Unit]
+Description=Managed OpenClaw agent provisioning request
+
+[Service]
+User=sable-claw
+Group=sable-claw
+LoadCredential=discord.env:/etc/sable-claw/discord.env
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+ExecStart=/usr/bin/python3 /opt/sable/integrations/lifecycle/provision-agents.py
+RuntimeDirectory=sable-agent-provisioner
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=sable-discord-onboarding
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+InaccessiblePaths=/var/lib/sable-connection-broker /var/lib/sable-integrations /var/lib/sable-shell /var/lib/sable-workload -/run/docker.sock
+ReadWritePaths=/var/lib/sable-claw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

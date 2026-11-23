@@ -1,0 +1,15 @@
+	@git_read {
+		path /__sable_git__/*
+		method GET POST
+	}
+	handle @git_read {
+		reverse_proxy 127.0.0.1:17897 {
+			header_up Host {upstream_hostport}
+			header_up -Authorization
+			header_up -Cookie
+			header_up -Forwarded
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+		}
+	}

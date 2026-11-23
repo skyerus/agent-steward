@@ -1,0 +1,14 @@
+{
+  "name": "sable-integration-broker-policy",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "casbin": "5.51.1"
+  },
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}
