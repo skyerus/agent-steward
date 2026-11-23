@@ -13,6 +13,7 @@ import urllib.request
 from discord_access import ACCESS_TOOLS, gateway_settings, list_access, update_channel, update_dm
 from discord_onboarding import Discord, DiscordError, Jobs, SetupError, actor_is_admin, advance, plan_for, status
 from schedules import ScheduleError, execute_schedule
+from discord_tools import describe_channel, resolve_channel, run as run_discord_tool
 
 CLAW = "/opt/sable/review-gateway/claw"
 CONFIG = Path("/var/lib/sable-claw/state/openclaw.json")
@@ -150,6 +151,12 @@ def provision_workspace(agent, action, **fields):
 def execute(command):
     name, args = command["name"], command["args"]
     user = command.get("requester")
+    if name == "inspect_discord_resource":
+        return describe_channel(Discord(), args.get("channel"))
+    if name == "resolve_discord_resource":
+        return resolve_channel(Discord(), configuration(), args["agent"], args["reference"])
+    if name in {"discord_read_messages", "discord_post_message"}:
+        return run_discord_tool(Discord(), name, args)
     if name == "manage_schedule":
         return execute_schedule(args, configuration(), rpc,
                                 os.environ.get("STATE_DIRECTORY", "/var/lib/sable-discord-onboarding"))

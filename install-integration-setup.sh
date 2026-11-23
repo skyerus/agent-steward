@@ -61,7 +61,7 @@ getent passwd sable-broker >/dev/null || useradd --system --user-group --no-crea
 stage=$(mktemp -d /root/sable-agent-install.XXXXXXXX)
 backup="$stage/backup"
 mkdir "$backup"
-files=(registry.mjs public-fetch.mjs remote.mjs broker.mjs browser-pairing.mjs github-registration.mjs github-native.mjs stdio-bridge.mjs access.mjs unix-request.mjs)
+files=(registry.mjs public-fetch.mjs remote.mjs broker.mjs browser-pairing.mjs github-registration.mjs github-native.mjs scoped-access.mjs stdio-bridge.mjs access.mjs unix-request.mjs)
 for file in "${files[@]}" review-plugin.mjs native-worker-policy.mjs schedule-tool.mjs lifecycle.test.mjs; do
   "$node" --check "$source_dir/broker/$file"
 done
@@ -235,7 +235,7 @@ changed=(
   /etc/systemd/system/sable-native-workspace.socket /etc/systemd/system/sable-native-workspace@.service
   "$code/native-workspace.py"
   /etc/systemd/system/sable-discord-onboarding.service /etc/systemd/system/sable-discord-onboarding.timer
-  "$shared/integration-setup/SKILL.md" "$code/provision-agents.py" "$code/discord_onboarding.py" "$code/discord_access.py" "$code/schedules.py"
+  "$shared/integration-setup/SKILL.md" "$code/provision-agents.py" "$code/discord_onboarding.py" "$code/discord_access.py" "$code/discord_tools.py" "$code/schedules.py"
 )
 for file in "${files[@]}"; do changed+=("$code/$file"); done
 for path in "${changed[@]}"; do
@@ -309,7 +309,7 @@ install -m 0644 "$source_dir/broker/sable-connection-broker.service" "$source_di
 install -m 0644 "$source_dir/broker/sable-agent-provisioner.socket" "$source_dir/broker/sable-agent-provisioner@.service" /etc/systemd/system/
 install -m 0644 "$source_dir/broker/sable-native-workspace.socket" "$source_dir/broker/sable-native-workspace@.service" /etc/systemd/system/
 install -m 0644 "$source_dir/broker/sable-discord-onboarding.service" "$source_dir/broker/sable-discord-onboarding.timer" /etc/systemd/system/
-install -m 0644 "$source_dir/broker/"{provision-agents,discord_onboarding,discord_access,schedules}.py "$code/"
+install -m 0644 "$source_dir/broker/"{provision-agents,discord_onboarding,discord_access,discord_tools,schedules}.py "$code/"
 install -m 0644 "$source_dir/broker/review-plugin.mjs" "$base/plugin/index.mjs"
 install -m 0644 "$source_dir/broker/native-worker-policy.mjs" "$base/plugin/native-worker-policy.mjs"
 install -m 0644 "$source_dir/broker/schedule-tool.mjs" "$base/plugin/schedule-tool.mjs"

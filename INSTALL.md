@@ -23,3 +23,11 @@ In an authorised Discord conversation, ask the agent to schedule, list, pause, e
 The installer adds the credential-bound Git endpoint to the same private relay used by the native worker. From an authorised Discord DM, Integration Admin can register a private GitHub App for the account and requested read or write permissions. After the owner installs it in GitHub, verification in the paired browser binds GitHub MCP and native Git to one credential record. The browser and Discord receive no signing key. The administrator can then share the connection with selected agents. On a new VPS, run the installer on the reviewed stack and repeat the browser flow for the new deployment.
 
 Integration Admin can deploy reviewed connector source to a downstream agent's `.agent-connectors` directory. The target agent runs that code in its normal workspace. Provider operations still require a broker connection and Luna review. The credential broker, its system services and Git request enforcement are outside the agent-managed workspace.
+
+### Self-service access requests
+
+An agent can request read or write access to an already connected GitHub App repository or to a Discord channel. Use the returned HTTPS approval page. A browser pairs once in an authorised Integration Admin DM, then the same browser can approve later requests. The page shows the exact resource, permission and recipient. The installer uses the existing `/connect/` HTTPS route.
+
+GitHub grants provide scoped native Git access. Existing broader connection shares are managed separately by Integration Admin. Discord grants can also cover threads under an approved parent with separate permissions. The bot needs the corresponding permissions in Discord. Each integration operation goes through Luna. A standing grant can target all downstream agents when explicitly approved by the administrator.
+
+Access requests, grants and browser authentication state live in the broker database. For a worker-only move, reconnect it to the same trusted integration service. Move broker state with its credentials through a private, access-controlled backup when migrating the broker itself. Pair new browsers after a hostname change.

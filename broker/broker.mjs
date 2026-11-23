@@ -16,6 +16,7 @@ import { Access, actorField, adminAgent, agentIdPattern, requireAccess, validAct
 import { unixRequest } from "./unix-request.mjs";
 import { githubMcpEndpoint } from "./github-registration.mjs";
 import { githubInstallation, GithubGit, installationTools } from "./github-native.mjs";
+import { ScopedAccess, approvalCookie } from "./scoped-access.mjs";
 
 const knownLegacy = Object.freeze({
   gmail: "Gmail",
@@ -34,11 +35,15 @@ const credentialDir = process.env.CREDENTIALS_DIRECTORY;
 const clients = credentialDir ? JSON.parse(readFileSync(join(credentialDir, "oauth-clients.json"), "utf8")) : [];
 const remote = new RemoteConnectors(registry, { origin: process.env.SABLE_SIGN_IN_ORIGIN, clients });
 const signInHost = new URL(remote.origin).host;
+const scopedAccess = new ScopedAccess(registry, {
+  origin: remote.origin,
+  isAdmin: user => provision("discord_is_admin", {}, user),
+});
 const queues = new Map();
 const githubGitEnabled = process.env.SABLE_NATIVE_GIT === "1";
 const gitAccess = new GithubGit({
-  checkGrant: async ({ actor, id, revision }) => {
-    requireAccess(await access.snapshot(actor), id, "use");
+  checkGrant: async ({ actor, id, revision, repository, push }) => {
+    await requireGit(actor, id, revision, repository, push ? "write" : "read");
     return registry.get(id, revision);
   },
 });
@@ -63,6 +68,11 @@ const discordUsers = { type: "array", maxItems: 100, items: name };
 const instructions = { type: "string", minLength: 1, maxLength: 12_000 };
 const requestId = { type: "string", minLength: 32, maxLength: 32, pattern: "^[0-9a-f]{32}$" };
 const callArguments = { type: "object" };
+const accessRequest = { type: "string", minLength: 43, maxLength: 43, pattern: "^[A-Za-z0-9_-]{43}$" };
+const permission = { type: "string", maxLength: 5, pattern: "^(read|write)$" };
+const provider = { type: "string", maxLength: 7, pattern: "^(github|discord)$" };
+const resource = { type: "string", minLength: 1, maxLength: 141 };
+const audience = { type: "string", maxLength: 14, pattern: "^(agent|all-downstream)$" };
 
 function tool(name, description, properties = {}, required = Object.keys(properties)) {
   return { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false } };
@@ -102,6 +112,20 @@ const management = [
         oldCommit: { type: "string", maxLength: 40, pattern: "^[0-9a-f]{40}$" },
         newCommit: { type: "string", maxLength: 40, pattern: "^[0-9a-f]{40}$" } }),
   ] : []),
+  tool("request_integration_access",
+    "Request access for the current agent. GitHub resource is owner/repo, and Discord resource is an exact channel name, mention or channel or thread ID. An administrator may specify agentId or explicitly select all-downstream for current and future agents. Return the browser approval link and resume only after status is approved.",
+    { provider, resource, permission, agentId, audience, threadPermission: permission }, ["provider","resource","permission"]),
+  tool("integration_access_status", "Check the status of a scoped integration access request.", { request: accessRequest }),
+  tool("pair_approval_browser", "Integration Admin only. Pair the approval browser with the eight-digit code sent in the current authorised DM.",
+    { request: accessRequest, code: { type: "string", minLength: 8, maxLength: 8, pattern: "^[0-9]{8}$" } }),
+  tool("list_scoped_integration_access", "Integration Admin only. List persistent resource grants."),
+  tool("revoke_scoped_integration_access", "Integration Admin only. Revoke an exact resource grant. Use * for the all-downstream rule.",
+    { provider, resource, id, revision, subject: { type: "string", minLength: 1, maxLength: 63 } }),
+  tool("discord_read_messages", "Read recent messages from an approved Discord channel or exact thread.",
+    { channel: channelId, guild: channelId, limit: { type: "integer", minimum: 1, maximum: 25 } }, ["channel","guild"]),
+  tool("discord_post_message", "Post or reply in an approved Discord channel or exact thread. Mentions are disabled.",
+    { channel: channelId, guild: channelId, content: { type: "string", minLength: 1, maxLength: 2000 }, replyTo: channelId },
+    ["channel","guild","content"]),
   tool("list_connection_access", "Integration Admin only. See which agents can use a connection.", { id, revision }),
   tool("grant_connection_access", "Integration Admin only. Share one connection with another agent.", { id, revision, agentId }),
   tool("revoke_connection_access", "Integration Admin only. Remove an agent's access to one connection.", { id, revision, agentId }),
@@ -140,7 +164,7 @@ function validInput(value, schema) {
       return typeof value === "string" && value.trim().length >= (schema.minLength ?? 1) && value.length <= schema.maxLength &&
         (!schema.pattern || new RegExp(schema.pattern).test(value));
     case "integer":
-      return Number.isSafeInteger(value) && value >= schema.minimum;
+      return Number.isSafeInteger(value) && value >= schema.minimum && value <= (schema.maximum ?? Number.MAX_SAFE_INTEGER);
     case "boolean":
       return typeof value === "boolean";
     case "array":
@@ -187,7 +211,7 @@ function requireConnectionCall(policy, id, name) {
 
 async function provision(name, args, requester) {
   try {
-    const output = await unixRequest("/run/sable-agent-provisioner.sock", { name, args, requester }, 45_000);
+    const output = await unixRequest(process.env.SABLE_PROVISIONER_SOCKET ?? "/run/sable-agent-provisioner.sock", { name, args, requester }, 45_000);
     if (!output.ok) throw new ConnectionError(output.error);
     return output.value;
   } catch (error) {
@@ -196,8 +220,111 @@ async function provision(name, args, requester) {
   }
 }
 
+const scopedTools = new Set(["request_integration_access", "integration_access_status", "pair_approval_browser",
+  "list_scoped_integration_access", "revoke_scoped_integration_access", "discord_read_messages", "discord_post_message"]);
+const gitTools = new Set(["authorize_git_read","authorize_git_push"]);
+const accessManagement = "integration-access";
+
+async function requireGit(actor, connection, revision, repository, mode) {
+  if (scopedAccess.allows(actor.agent, "github", connection, revision, repository, mode)) return;
+  requireAccess(await access.snapshot(actor), connection, "use");
+}
+
+function adminCanManage(policy) {
+  return policy.can(accessManagement, "share");
+}
+
+async function checkScopedTarget(scope, user) {
+  if (scope.agent !== "*") {
+    const agents = await provision("list_managed_agents", {}, user);
+    if (!agents.some(item => item.id === scope.agent)) throw new ConnectionError("The target agent no longer exists.");
+  }
+  if (scope.provider === "discord") {
+    const target = await provision("inspect_discord_resource", { channel: scope.resource }, user);
+    if (scope.connection !== target.guild) throw new ConnectionError("The Discord channel belongs to a different server.");
+    return;
+  }
+  const row = registry.get(scope.connection, scope.revision);
+  const app = githubInstallation(row);
+  if (!app || scope.permission === "write" && app.access === "read" ||
+      !(app.repository === scope.resource || app.account === scope.resource.split("/")[0])) {
+    throw new ConnectionError("The GitHub App lacks the requested repository or permission.");
+  }
+}
+
+async function discordScope(actor, args, mode) {
+  if (scopedAccess.allows(actor.agent, "discord", args.guild, 1, args.channel, mode)) return {};
+  if (scopedAccess.hasDiscordThreadGrant(actor.agent, args.guild)) {
+    const target = await provision("inspect_discord_resource", { channel: args.channel }, actor.user);
+    if (target.guild === args.guild && target.parent &&
+        scopedAccess.allowsDiscordThread(actor.agent, args.guild, target.parent, mode)) {
+      return { parentChannel: target.parent };
+    }
+  }
+  throw new ConnectionError("Request browser approval for this Discord channel or thread.");
+}
+
+async function manageScoped(tool, args, actor, policy) {
+  const administrator = adminCanManage(policy);
+  switch (tool) {
+    case "request_integration_access": {
+      if (args.agentId !== undefined && args.agentId !== actor.agent || args.audience === "all-downstream") {
+        requireAccess(policy, accessManagement, "share");
+      }
+      const agent = args.audience === "all-downstream" ? "*" : args.agentId ?? actor.agent;
+      const scope = { provider: args.provider, agent, resource: args.resource, permission: args.permission };
+      if (scope.provider === "github") {
+        scope.resource = scope.resource.toLowerCase().trim();
+        const account = scope.resource.split("/")[0];
+        const rows = registry.list().filter(item => item.endpoint === githubMcpEndpoint && item.status === "connected");
+        const matches = rows.filter(item => {
+          const app = githubInstallation(registry.get(item.id));
+          return app?.account === account || app?.repository === scope.resource;
+        });
+        if (matches.length !== 1) {
+          throw new ConnectionError("Connect one GitHub App for that account through Integration Admin, then request access.");
+        }
+        const row = matches[0];
+        scope.connection = row.id;
+        scope.revision = row.revision;
+        scope.label = row.label;
+        await checkScopedTarget(scope, actor.user);
+      } else {
+        const reference = /^<#([0-9]{16,22})>$/.exec(scope.resource)?.[1] ?? scope.resource;
+        const target = await provision("resolve_discord_resource", { agent: agent === "*" ? actor.agent : agent, reference }, actor.user);
+        scope.resource = target.channel;
+        scope.connection = target.guild;
+        scope.revision = 1;
+        scope.label = `${target.server} / #${target.name}`;
+        if (args.threadPermission !== undefined) {
+          if (target.parent) throw new ConnectionError("Set thread permissions on the parent text channel.");
+          scope.threadPermission = args.threadPermission;
+        }
+      }
+      return result(scopedAccess.request(actor, scope));
+    }
+    case "integration_access_status":
+      return result(scopedAccess.status(args.request, actor, administrator));
+    case "pair_approval_browser":
+      return result(await scopedAccess.pair(args.request, actor, args.code));
+    case "list_scoped_integration_access":
+      requireAccess(policy, accessManagement, "share");
+      return result(scopedAccess.list());
+    case "revoke_scoped_integration_access":
+      requireAccess(policy, accessManagement, "share");
+      return result({ revoked: scopedAccess.remove({ agent: args.subject, provider: args.provider, connection: args.id,
+        revision: args.revision, resource: args.resource }) === 1 });
+    default: {
+      const mode = tool === "discord_post_message" ? "write" : "read";
+      const scope = await discordScope(actor, args, mode);
+      return result(await provision(tool, { ...args, ...scope }, actor.user));
+    }
+  }
+}
+
 async function manage(call) {
   const { args, actor } = validated(call);
+  if (scopedTools.has(call.name)) return manageScoped(call.name, args, actor, await access.snapshot(actor));
   if (call.name === "list_connections") {
     const policy = await access.snapshot(actor);
     return result(registry.list().filter(row => policy.can(row.id, "use") || policy.can(row.id, "manage")));
@@ -221,7 +348,11 @@ async function manage(call) {
     return result(await provision(call.name, args, actor.user));
   }
   return serialized(args.id, async () => {
-    requireConnectionCall(await access.snapshot(actor), args.id, call.name);
+    if (gitTools.has(call.name)) {
+      await requireGit(actor, args.id, args.revision, args.repository, call.name === "authorize_git_push" ? "write" : "read");
+    } else {
+      requireConnectionCall(await access.snapshot(actor), args.id, call.name);
+    }
     const row = registry.get(args.id, args.revision);
     switch (call.name) {
       case "diagnose_connection":
@@ -342,9 +473,24 @@ async function reviewTarget(payload) {
     requireAccess(policy, "agents", "agents");
   }
   if (name === "list_connections" || name === "add_connection") return { operation };
+  if (scopedTools.has(name)) {
+    if (["pair_approval_browser", "list_scoped_integration_access", "revoke_scoped_integration_access"].includes(name) ||
+        name === "request_integration_access" && (args?.audience === "all-downstream" || args?.agentId && args.agentId !== actor.agent)) {
+      requireAccess(policy, accessManagement, "share");
+    }
+    if (name === "discord_read_messages" || name === "discord_post_message") {
+      const mode = name === "discord_post_message" ? "write" : "read";
+      await discordScope(actor, args, mode);
+    }
+    return { operation };
+  }
   const { id, revision } = args ?? {};
   if (typeof id !== "string" || !Number.isSafeInteger(revision)) throw new ConnectionError("Invalid connection reference.");
-  requireConnectionCall(policy, id, name);
+  if (gitTools.has(name)) {
+    await requireGit(actor, id, revision, args.repository, name === "authorize_git_push" ? "write" : "read");
+  } else {
+    requireConnectionCall(policy, id, name);
+  }
   return { operation, connection: registry.describe(registry.get(id, revision)) };
 }
 
@@ -488,6 +634,35 @@ async function clientForm(request) {
   return { clientId: form.get("client_id"), clientSecret: form.get("client_secret"), authMethod: form.get("auth_method") };
 }
 
+async function accessBrowser(request, response, id) {
+  const cookies = (request.headers.cookie ?? "").split("; ").filter(item => item.startsWith(`${approvalCookie}=`));
+  const cookie = cookies.length === 1 ? cookies[0].slice(approvalCookie.length + 1) : undefined;
+  const browserId = isBrowserId(cookie) ? cookie : newBrowserId();
+  if (request.method === "POST") {
+    if (request.headers.origin !== remote.origin) return page(response, 403, "<p>Submit approval from its original tab.</p>");
+    await scopedAccess.approve(id, browserId, checkScopedTarget);
+    return page(response, 200, "<h1>Access approved</h1><p>Return to your agent. It can check the request and continue.</p>");
+  }
+  if (request.method !== "GET") return page(response, 405, "<p>Open the approval page in your browser.</p>");
+  if (!await scopedAccess.browserAdmin(browserId)) {
+    const code = scopedAccess.code(id, browserId);
+    return page(response, 200, `<h1>Pair this approval browser</h1>
+      <p>In your private Integration Admin DM, send this exact line:</p>
+      <p><code>Pair integration approval ${markup(id)} with code ${markup(code)}</code></p>
+      <p><a href="/connect/access/${markup(id)}">Check pairing</a></p>`,
+      { "Set-Cookie": `${approvalCookie}=${browserId}; Max-Age=604800; Path=/; Secure; HttpOnly; SameSite=Lax` });
+  }
+  const { scope, approved } = scopedAccess.load(id);
+  const recipient = scope.agent === "*" ? "All current and future downstream agents" : scope.agent;
+  return page(response, 200, `<h1>Review integration access</h1>
+    <dl><dt>Agent</dt><dd>${markup(recipient)}</dd><dt>Connection</dt><dd>${markup(scope.label)}</dd>
+    <dt>Resource</dt><dd><code>${markup(scope.resource)}</code></dd><dt>Permissions</dt><dd>${markup(scope.permission)}</dd></dl>
+    ${scope.threadPermission ? `<p>Threads under this channel have ${markup(scope.threadPermission)} access.</p>` : ""}
+    ${scope.provider === "github" ? "<p>This adds a native Git grant. Administrators can review or revoke broader existing connection access separately.</p>" : ""}
+    <p>Integration calls go through Luna.</p>
+    ${approved ? "<p>Already approved.</p>" : '<form method="post"><button>Approve requested access</button></form>'}`);
+}
+
 const browser = http.createServer(async (request, response) => {
   const host = request.headers.host;
   if (host !== signInHost || !request.url?.startsWith("/") ||
@@ -497,6 +672,8 @@ const browser = http.createServer(async (request, response) => {
   let attempt;
   try {
     const url = new URL(request.url, remote.origin);
+    const accessId = /^\/connect\/access\/([A-Za-z0-9_-]{43})$/.exec(url.pathname)?.[1];
+    if (accessId) return await accessBrowser(request, response, accessId);
     const cookies = (request.headers.cookie ?? "").split("; ").filter(item => item.startsWith(`${pairingCookie}=`));
     const browserId = cookies.length === 1 ? cookies[0].slice(pairingCookie.length + 1) : undefined;
     const link = /^\/connect\/([\w-]{43})$/.exec(url.pathname)?.[1];
@@ -591,5 +768,5 @@ const browser = http.createServer(async (request, response) => {
     page(response, 400, `<p>${markup(message)}</p>`);
   }
 });
-browser.listen(17896, "127.0.0.1");
-if (githubGitEnabled) gitAccess.server().listen(17897, "127.0.0.1");
+browser.listen(Number(process.env.SABLE_BROWSER_PORT ?? 17896), "127.0.0.1");
+if (githubGitEnabled) gitAccess.server().listen(Number(process.env.SABLE_GIT_PORT ?? 17897), "127.0.0.1");

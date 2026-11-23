@@ -394,7 +394,7 @@ export default function register(api) {
     if (!/^[0-9]{16,22}$/.test(actor.user) || !/^[a-z][a-z0-9_-]{0,62}$/.test(actor.agent)) {
       return { block: true, blockReason: "An authenticated Discord requester is required." };
     }
-    if (tool.service === "integrations" && tool.name === "confirm_sign_in") {
+    if (tool.service === "integrations" && ["confirm_sign_in", "pair_approval_browser"].includes(tool.name)) {
       const codes = turn.currentText?.match(/(?<![0-9])[0-9]{8}(?![0-9])/g) ?? [];
       if (!codes.includes(providerArgs.code)) {
         return { block: true, blockReason: "Use the pairing code from the requester's current Discord message." };
