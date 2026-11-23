@@ -7,6 +7,7 @@ const requestLifetime = 30 * 60_000;
 const sessionLifetime = 7 * 24 * 60 * 60_000;
 const repoPattern = /^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9_][a-z0-9_.-]{0,99}$/;
 const sessionKey = value => createHash("sha256").update(value).digest("hex");
+export const mcpToolPattern = /^[A-Za-z0-9_.:-]{1,100}$/;
 export const approvalCookie = "__Host-steward-approval";
 
 export class ScopedAccess {
@@ -37,9 +38,14 @@ export class ScopedAccess {
   }
 
   request(actor, scope) {
-    if (!["read", "write"].includes(scope.permission) ||
+    const mcp = scope.provider === "mcp";
+    if (!(mcp ? scope.permission === "invoke" : ["read", "write"].includes(scope.permission)) ||
         (scope.agent !== "*" && !agentIdPattern.test(scope.agent)) ||
-        !["github", "discord"].includes(scope.provider) ||
+        !["github", "discord", "mcp"].includes(scope.provider) ||
+        (mcp && (!Array.isArray(scope.tools) || !scope.tools.length || scope.tools.length > 30 ||
+          new Set(scope.tools).size !== scope.tools.length ||
+          !(scope.tools.length === 1 && scope.tools[0] === "*") && !scope.tools.every(tool => mcpToolPattern.test(tool)))) ||
+        (!mcp && scope.tools !== undefined) ||
         (scope.threadPermission !== undefined && (scope.provider !== "discord" || !["read","write"].includes(scope.threadPermission))) ||
         (scope.provider === "github" && (!repoPattern.test(scope.resource) || scope.resource.endsWith(".git"))) ||
         (scope.provider === "discord" && !discordIdPattern.test(scope.resource))) {
@@ -68,9 +74,11 @@ export class ScopedAccess {
     }
     if (!row.approved) return { status: "approval_required" };
     const { agent, provider, connection, revision, resource, permission, threadPermission } = row.scope;
-    const active = this.list().some(grant => grant.agent === agent && grant.provider === provider &&
-      grant.connection === connection && grant.revision === revision && grant.resource === resource &&
-      grant.permission === permission && (grant.threadPermission ?? undefined) === threadPermission);
+    const grants = this.list();
+    const active = (row.scope.tools ?? [resource]).every(item => grants.some(grant =>
+      grant.agent === agent && grant.provider === provider && grant.connection === connection &&
+      grant.revision === revision && grant.resource === item && grant.permission === permission &&
+      (grant.threadPermission ?? undefined) === threadPermission));
     return active ? { status: "approved", grant: row.scope, revision } : { status: "inactive" };
   }
 
@@ -119,15 +127,17 @@ export class ScopedAccess {
     if (!await this.browserAdmin(browser)) throw new ConnectionError("The approving administrator no longer has access.");
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (scope.provider === "github") this.registry.get(scope.connection, scope.revision);
+      if (scope.provider !== "discord") this.registry.get(scope.connection, scope.revision);
       const changed = this.db.prepare("UPDATE scoped_integration_requests SET approved=? WHERE id=? AND approved IS NULL AND expires>?")
         .run(this.now(), id, this.now());
       if (!changed.changes) throw new ConnectionError("The request was already handled or expired.");
-      this.db.prepare(`INSERT INTO scoped_integration_grants
+      const save = this.db.prepare(`INSERT INTO scoped_integration_grants
         (agent,provider,connection,revision,resource,permission,thread_permission) VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(agent,provider,connection,resource) DO UPDATE SET revision=excluded.revision,
-          permission=excluded.permission,thread_permission=excluded.thread_permission`)
-        .run(scope.agent, scope.provider, scope.connection, scope.revision, scope.resource, scope.permission, scope.threadPermission ?? null);
+          permission=excluded.permission,thread_permission=excluded.thread_permission`);
+      for (const resource of scope.tools ?? [scope.resource]) {
+        save.run(scope.agent, scope.provider, scope.connection, scope.revision, resource, scope.permission, scope.threadPermission ?? null);
+      }
       this.db.exec("COMMIT");
       return scope;
     } catch (error) {
@@ -140,6 +150,18 @@ export class ScopedAccess {
     return Boolean(this.db.prepare(`SELECT 1 FROM scoped_integration_grants
       WHERE (agent=? OR agent='*' AND ?<>?) AND provider=? AND connection=? AND revision=? AND resource=?
       AND (permission='write' OR ?='read')`).get(agent, agent, adminAgent, provider, connection, revision, resource, permission));
+  }
+
+  mcpGrants(agent, connection, revision) {
+    return new Set(this.db.prepare(`SELECT resource FROM scoped_integration_grants
+      WHERE (agent=? OR agent='*' AND ?<>?) AND provider='mcp' AND connection=? AND revision=?
+        AND permission='invoke'`).all(agent, agent, adminAgent, connection, revision).map(row => row.resource));
+  }
+
+  sharedConnection(row) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM scoped_integration_grants
+      WHERE provider IN ('mcp','github') AND connection=? AND revision=? AND agent<>?`)
+      .get(row.id, row.revision, row.owner_agent));
   }
 
   hasDiscordThreadGrant(agent, guild) {

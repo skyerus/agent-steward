@@ -92,3 +92,36 @@ test("an approval cannot attach to a changed GitHub connection", async () => {
   }),/destination changed/);
   assert(!store.allows(worker.agent,"github",row.id,row.revision,grant.resource,"write"));
 });
+
+test("MCP grants are scoped to exact operations, destination revision, and agent", async () => {
+  const registry = new Registry(":memory:");
+  const store = new ScopedAccess(registry, config);
+  const publisher = "publisher";
+  const row = registry.add("Provider MCP", "https://provider.example.com/mcp", publisher, { fixture: true });
+  const scope = { agent: worker.agent, provider: "mcp", connection: row.id, revision: row.revision,
+    resource: row.id, permission: "invoke", label: row.label, tools: ["get_data", "list_data"] };
+  const { request } = store.request(worker, scope);
+  assert.deepEqual(store.mcpGrants(worker.agent, row.id, row.revision), new Set());
+  assert.throws(() => store.request(worker, { ...scope, tools: ["*", "list_data"] }), /Specify an exact/);
+
+  const browser = newBrowserId();
+  await store.pair(request, owner, store.code(request, browser));
+  await store.approve(request, browser, async () => {});
+  assert.deepEqual(store.mcpGrants(worker.agent, row.id, row.revision), new Set(scope.tools));
+  assert.deepEqual(store.mcpGrants("other-worker", row.id, row.revision), new Set());
+  assert.deepEqual(store.mcpGrants(worker.agent, row.id, row.revision + 1), new Set());
+  assert(store.sharedConnection({ ...row, owner_agent: publisher }));
+  assert.equal(store.status(request, worker, false).status, "approved");
+
+  assert.equal(store.remove({ ...scope, resource: "get_data" }), 1);
+  assert.equal(store.status(request, worker, false).status, "inactive");
+  assert.deepEqual(store.mcpGrants(worker.agent, row.id, row.revision), new Set(["list_data"]));
+
+  const standing = store.request(owner, { ...scope, agent: "*", tools: ["*"] });
+  await store.approve(standing.request, browser, async () => {});
+  assert(store.mcpGrants("future-agent", row.id, row.revision).has("*"));
+  assert(!store.mcpGrants(owner.agent, row.id, row.revision).has("*"));
+  registry.edit(row.id, row.revision, { endpoint: "https://new.example.com/mcp" });
+  assert.deepEqual(store.mcpGrants("future-agent", row.id, row.revision + 1), new Set());
+  assert.equal(store.status(standing.request, owner, true).status, "inactive");
+});

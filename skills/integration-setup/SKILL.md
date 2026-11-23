@@ -31,8 +31,10 @@ Use `authorize_git_read` for clone or fetch and `authorize_git_push` for one rev
 
 ## Requesting scoped access
 
-When you need native Git or Discord channel access, call `request_integration_access` and send its browser link to the requester. Set the provider, exact repository, channel name, mention, or ID, and the required read or write permission. For Discord, add `threadPermission` on a parent channel when the request includes its threads. A requester with Integration Admin access can also choose a specific downstream agent or the `all-downstream` standing grant.
+Use `request_integration_access` and send the returned approval link for any connected integration. For native Git, specify the exact repository and read or write. For Discord, specify the channel name, mention or ID, with separate `threadPermission` if needed. For any MCP connection, set `provider: mcp` and use its exact label or ID as `resource`. Use the existing tool catalog to request exact `tools`. Only use `allTools: true` when the user asked for the whole connection, including future tools. A standing grant uses `audience: all-downstream` and must be requested by Integration Admin.
 
 The approval page displays the account, resource, scope, and recipient. Pair a new approval browser in your private Integration Admin DM with `pair_approval_browser` using the exact request ID and code from that message. Return to the browser and approve. Subsequent links work from that paired browser until its session expires. Check `integration_access_status` after approval. Use the connection ID and revision from the approved grant when requesting a native Git permit.
+
+After a scoped MCP grant is approved, use `list_connections` and `list_connection_tools` to discover the approved connection and tools. Execute through `call_connection_tool`. Agent Steward scopes MCP access to the named operations. A provider's finer-grained permissions still apply.
 
 Use `discord_read_messages` and `discord_post_message` for approved Discord resources. Supply exact channel and server IDs. A thread grant follows the actual parent returned by Discord. Existing Discord bot permissions apply. Integration Admin can list and revoke exact scopes with `list_scoped_integration_access` and `revoke_scoped_integration_access`. All integration operations go through the reviewer.

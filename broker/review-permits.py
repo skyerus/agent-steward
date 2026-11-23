@@ -52,7 +52,7 @@ def review_target(data):
     payload = {
         "service": data["service"], "name": data["name"], "actor": data["actor"],
         "fields": list(args),
-        "args": {key: args[key] for key in ("id", "revision", "agentId", "audience", "repository", "guild", "channel") if key in args},
+        "args": {key: args[key] for key in ("id", "revision", "agentId", "audience", "repository", "guild", "channel", "name") if key in args},
     }
     return broker_request(b"review-target", payload, 2, 8192)
 

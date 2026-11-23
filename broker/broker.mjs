@@ -16,7 +16,7 @@ import { Access, actorField, adminAgent, agentIdPattern, requireAccess, validAct
 import { unixRequest } from "./unix-request.mjs";
 import { githubMcpEndpoint } from "./github-registration.mjs";
 import { githubInstallation, GithubGit, installationTools } from "./github-native.mjs";
-import { ScopedAccess, approvalCookie } from "./scoped-access.mjs";
+import { ScopedAccess, approvalCookie, mcpToolPattern } from "./scoped-access.mjs";
 
 const knownLegacy = Object.freeze({
   gmail: "Gmail",
@@ -28,9 +28,9 @@ const legacy = Object.fromEntries((process.env.SABLE_LEGACY_CONNECTIONS ?? "").s
   .filter(name => Object.hasOwn(knownLegacy, name))
   .map(name => [name, knownLegacy[name]]));
 const identity = { name: "sable-integration-broker", version: "1.0.0" };
+const legacySocketDirectory = process.env.SABLE_LEGACY_SOCKET_DIR ?? "/run";
 const registry = new Registry(process.argv[2], legacy);
 registry.migrateLegacyAccess(JSON.parse(process.env.SABLE_LEGACY_GRANTS ?? "{}"));
-const access = new Access(registry, user => provision("discord_is_admin", {}, user));
 const credentialDir = process.env.CREDENTIALS_DIRECTORY;
 const clients = credentialDir ? JSON.parse(readFileSync(join(credentialDir, "oauth-clients.json"), "utf8")) : [];
 const remote = new RemoteConnectors(registry, { origin: process.env.SABLE_SIGN_IN_ORIGIN, clients });
@@ -39,6 +39,7 @@ const scopedAccess = new ScopedAccess(registry, {
   origin: remote.origin,
   isAdmin: user => provision("discord_is_admin", {}, user),
 });
+const access = new Access(registry, user => provision("discord_is_admin", {}, user), row => scopedAccess.sharedConnection(row));
 const queues = new Map();
 const githubGitEnabled = process.env.SABLE_NATIVE_GIT === "1";
 const gitAccess = new GithubGit({
@@ -70,7 +71,7 @@ const requestId = { type: "string", minLength: 32, maxLength: 32, pattern: "^[0-
 const callArguments = { type: "object" };
 const accessRequest = { type: "string", minLength: 43, maxLength: 43, pattern: "^[A-Za-z0-9_-]{43}$" };
 const permission = { type: "string", maxLength: 5, pattern: "^(read|write)$" };
-const provider = { type: "string", maxLength: 7, pattern: "^(github|discord)$" };
+const provider = { type: "string", maxLength: 7, pattern: "^(github|discord|mcp)$" };
 const resource = { type: "string", minLength: 1, maxLength: 141 };
 const audience = { type: "string", maxLength: 14, pattern: "^(agent|all-downstream)$" };
 
@@ -94,7 +95,7 @@ const management = [
   }, ["id", "revision"]),
   tool("confirm_sign_in", "Pair the requester's browser using the eight-digit code the requester just sent in Discord.", { id, revision,
     code: { type: "string", minLength: 8, maxLength: 8, pattern: "^[0-9]{8}$" } }),
-  tool("list_connection_tools", "Read the tool names and schemas exposed by a connected remote MCP server.", { id, revision }),
+  tool("list_connection_tools", "Read authorized tool names and schemas on a connected MCP server. Integration Admin can inspect the full catalog to prepare scoped access.", { id, revision }),
   tool("call_connection_tool", "Run the named tool with these arguments on this integration and destination revision.", { id, revision, name, arguments: callArguments }),
   ...(githubGitEnabled ? [
     tool("begin_github_installation",
@@ -113,8 +114,10 @@ const management = [
         newCommit: { type: "string", maxLength: 40, pattern: "^[0-9a-f]{40}$" } }),
   ] : []),
   tool("request_integration_access",
-    "Request access for the current agent. GitHub resource is owner/repo, and Discord resource is an exact channel name, mention or channel or thread ID. An administrator may specify agentId or explicitly select all-downstream for current and future agents. Return the browser approval link and resume only after status is approved.",
-    { provider, resource, permission, agentId, audience, threadPermission: permission }, ["provider","resource","permission"]),
+    "Request browser approval for the current agent. GitHub resource is owner/repo. Discord resource is a channel name, mention or ID. Both take read or write permission. For any MCP connection, pass its exact label or ID as resource and either exact tool names from the catalog or allTools for explicitly requested whole-connection access. An administrator may target another agent or all-downstream. Return the link and check its status before proceeding.",
+    { provider, resource, permission, agentId, audience, threadPermission: permission,
+      tools: { type: "array", minItems: 1, maxItems: 30, items: { ...name, pattern: mcpToolPattern.source } },
+      allTools: { type: "boolean" } }, ["provider","resource"]),
   tool("integration_access_status", "Check the status of a scoped integration access request.", { request: accessRequest }),
   tool("pair_approval_browser", "Integration Admin only. Pair the approval browser with the eight-digit code sent in the current authorised DM.",
     { request: accessRequest, code: { type: "string", minLength: 8, maxLength: 8, pattern: "^[0-9]{8}$" } }),
@@ -130,7 +133,7 @@ const management = [
   tool("grant_connection_access", "Integration Admin only. Share one connection with another agent.", { id, revision, agentId }),
   tool("revoke_connection_access", "Integration Admin only. Remove an agent's access to one connection.", { id, revision, agentId }),
   tool("list_managed_agents", "Integration Admin only. Read the configured agents and their Discord bindings."),
-  tool("create_agent", "Integration Admin only. Create a downstream agent with an empty, isolated workspace and no account access.", { agentId, name }),
+  tool("create_agent", "Integration Admin only. Create a downstream agent with an empty, isolated workspace. Approved standing grants apply automatically.", { agentId, name }),
   tool("rename_agent", "Integration Admin only. Change a downstream agent's display name.", { agentId, name }),
   tool("set_agent_instructions", "Integration Admin only. Replace a downstream agent's AGENTS.md with its approved role and operating instructions.", { agentId, instructions }),
   tool("deploy_agent_connector",
@@ -203,10 +206,30 @@ const sharingTools = new Set(["list_connection_access", "grant_connection_access
 const usageTools = new Set(["list_connection_tools", "call_connection_tool", "authorize_git_read", "authorize_git_push"]);
 const permissionFor = name => sharingTools.has(name) ? "share" : usageTools.has(name) ? "use" : "manage";
 
-function requireConnectionCall(policy, id, name) {
-  if (name === "diagnose_connection" && policy.can(id, "use")) return;
-  if (name === "begin_github_installation") requireAccess(policy, id, "share");
-  requireAccess(policy, id, permissionFor(name));
+function requireConnectionCall(policy, actor, row, name, toolName) {
+  if (name === "diagnose_connection" && policy.can(row.id, "use")) return;
+  if (name === "list_connection_tools" || name === "call_connection_tool") {
+    return requireMcpAccess(policy, actor, row, name === "call_connection_tool" ? toolName : undefined);
+  }
+  if (name === "begin_github_installation") requireAccess(policy, row.id, "share");
+  requireAccess(policy, row.id, permissionFor(name));
+}
+
+function requireMcpAccess(policy, actor, row, operation) {
+  if (policy.can(row.id, "use") || (operation === undefined && policy.can(row.id, "share"))) return;
+  const grants = scopedAccess.mcpGrants(actor.agent, row.id, row.revision);
+  if (grants.has("*")) return;
+  if (operation === undefined ? grants.size > 0 : grants.has(operation)) return grants;
+  throw new ConnectionError("This agent needs browser approval for that integration tool.");
+}
+
+function mcpConnection(row, call) {
+  if (row.legacy) {
+    if (!Object.hasOwn(legacy, row.id)) throw new ConnectionError("This connection has no configured connector.");
+    return withLegacy(row.id, call);
+  }
+  const installation = githubInstallation(row);
+  return installation ? installationTools(row, installation, call) : remote.tools(row, call);
 }
 
 async function provision(name, args, requester) {
@@ -245,6 +268,16 @@ async function checkScopedTarget(scope, user) {
     return;
   }
   const row = registry.get(scope.connection, scope.revision);
+  if (scope.provider === "mcp") {
+    if (!row.legacy && !row.credential) throw new ConnectionError("Complete provider sign-in before granting access.");
+    if (!scope.tools.includes("*")) {
+      const available = new Set((await mcpConnection(row)).tools.map(tool => tool.name));
+      if (scope.tools.some(tool => !available.has(tool))) {
+        throw new ConnectionError("One or more requested tools are missing from the connector catalog. Check the exact names.");
+      }
+    }
+    return;
+  }
   const app = githubInstallation(row);
   if (!app || scope.permission === "write" && app.access === "read" ||
       !(app.repository === scope.resource || app.account === scope.resource.split("/")[0])) {
@@ -273,6 +306,29 @@ async function manageScoped(tool, args, actor, policy) {
       }
       const agent = args.audience === "all-downstream" ? "*" : args.agentId ?? actor.agent;
       const scope = { provider: args.provider, agent, resource: args.resource, permission: args.permission };
+      if (scope.provider === "mcp") {
+        if (args.permission !== undefined || args.threadPermission !== undefined ||
+            Boolean(args.tools) === Boolean(args.allTools)) {
+          throw new ConnectionError("Specify exact MCP tools or explicitly request the whole connection.");
+        }
+        const visible = registry.list();
+        const matches = visible.filter(row => row.id === args.resource || row.label === args.resource);
+        if (matches.length !== 1) throw new ConnectionError("Use the exact integration label or connection ID.");
+        const row = matches[0];
+        scope.connection = row.id;
+        scope.revision = row.revision;
+        scope.label = row.label;
+        scope.destination = row.endpoint ? new URL(row.endpoint).origin : `Bundled connector: ${row.id}`;
+        scope.resource = row.id;
+        scope.permission = "invoke";
+        scope.tools = args.allTools ? ["*"] : args.tools;
+        await checkScopedTarget(scope, actor.user);
+        return result(scopedAccess.request(actor, scope));
+      }
+      if (!args.permission || args.tools !== undefined || args.allTools !== undefined ||
+          (scope.provider !== "discord" && args.threadPermission !== undefined)) {
+        throw new ConnectionError("Specify read or write for the GitHub repository or Discord channel.");
+      }
       if (scope.provider === "github") {
         scope.resource = scope.resource.toLowerCase().trim();
         const account = scope.resource.split("/")[0];
@@ -327,7 +383,8 @@ async function manage(call) {
   if (scopedTools.has(call.name)) return manageScoped(call.name, args, actor, await access.snapshot(actor));
   if (call.name === "list_connections") {
     const policy = await access.snapshot(actor);
-    return result(registry.list().filter(row => policy.can(row.id, "use") || policy.can(row.id, "manage")));
+    return result(registry.list().filter(row => policy.can(row.id, "use") || policy.can(row.id, "manage") ||
+      scopedAccess.mcpGrants(actor.agent, row.id, row.revision).size > 0));
   }
   if (call.name === "add_connection") {
     const policy = await access.snapshot(actor);
@@ -348,12 +405,13 @@ async function manage(call) {
     return result(await provision(call.name, args, actor.user));
   }
   return serialized(args.id, async () => {
+    const row = registry.get(args.id, args.revision);
+    let selectedTools;
     if (gitTools.has(call.name)) {
       await requireGit(actor, args.id, args.revision, args.repository, call.name === "authorize_git_push" ? "write" : "read");
     } else {
-      requireConnectionCall(await access.snapshot(actor), args.id, call.name);
+      selectedTools = requireConnectionCall(await access.snapshot(actor), actor, row, call.name, args.name);
     }
-    const row = registry.get(args.id, args.revision);
     switch (call.name) {
       case "diagnose_connection":
         {
@@ -408,19 +466,17 @@ async function manage(call) {
         return result({ connection: row.id, agent: args.agentId, access: "revoked" });
       case "list_connection_tools":
       case "call_connection_tool":
-        if (row.legacy && !Object.hasOwn(legacy, row.id)) throw new ConnectionError("This connection has no configured connector.");
         const invoke = call.name === "call_connection_tool" ? { name: args.name, arguments: args.arguments } : undefined;
-        const installation = githubInstallation(row);
-        const output = await (row.legacy ? withLegacy(row.id, invoke)
-          : installation ? installationTools(row, installation, invoke) : remote.tools(row, invoke));
-        return invoke ? output : result(output);
+        const output = await mcpConnection(row, invoke);
+        if (invoke) return output;
+        return result(selectedTools ? { ...output, tools: output.tools.filter(tool => selectedTools.has(tool.name)) } : output);
     }
   });
 }
 
 async function withLegacy(route, call) {
   const transport = new StdioClientTransport({
-    command: "/usr/bin/socat", args: ["-", `UNIX-CONNECT:/run/sable-mcp-${route}.sock`], stderr: "ignore",
+    command: "/usr/bin/socat", args: ["-", `UNIX-CONNECT:${join(legacySocketDirectory, `sable-mcp-${route}.sock`)}`], stderr: "ignore",
   });
   const client = new Client(identity);
   const options = { timeout: 30_000 };
@@ -434,12 +490,6 @@ async function withLegacy(route, call) {
 
 async function legacyTools(route, call) {
   return serialized(route, async () => {
-    let providerCall;
-    if (call) {
-      const { [actorField]: actor, ...args } = call.arguments ?? {};
-      requireAccess(await access.snapshot(actor), route, "use");
-      providerCall = { ...call, arguments: args };
-    }
     let row;
     try { row = registry.get(route); } catch (error) {
       if (!(error instanceof ConnectionError)) throw error;
@@ -448,7 +498,10 @@ async function legacyTools(route, call) {
       if (!call) return { tools: [] };
       throw new ConnectionError("The original integration is disconnected. List connections for the current destination.");
     }
-    return withLegacy(route, providerCall);
+    if (!call) return withLegacy(route, undefined);
+    const { [actorField]: actor, ...args } = call.arguments ?? {};
+    requireMcpAccess(await access.snapshot(actor), actor, row, call.name);
+    return withLegacy(route, { ...call, arguments: args });
   });
 }
 
@@ -456,8 +509,8 @@ async function reviewTarget(payload) {
   const { service, name, args, fields, actor } = payload;
   const policy = await access.snapshot(actor);
   if (Object.hasOwn(legacy, service)) {
-    requireAccess(policy, service, "use");
     const row = registry.get(service);
+    requireMcpAccess(policy, actor, row, name);
     if (!row.legacy) throw new ConnectionError("This connection's original destination is disconnected.");
     return { connection: registry.describe(row) };
   }
@@ -486,12 +539,13 @@ async function reviewTarget(payload) {
   }
   const { id, revision } = args ?? {};
   if (typeof id !== "string" || !Number.isSafeInteger(revision)) throw new ConnectionError("Invalid connection reference.");
+  const row = registry.get(id, revision);
   if (gitTools.has(name)) {
     await requireGit(actor, id, revision, args.repository, name === "authorize_git_push" ? "write" : "read");
   } else {
-    requireConnectionCall(policy, id, name);
+    requireConnectionCall(policy, actor, row, name, args.name);
   }
-  return { operation, connection: registry.describe(registry.get(id, revision)) };
+  return { operation, connection: registry.describe(row) };
 }
 
 function attachLocalRequest(socket, prefix, handler, maxBytes, visibleError = ToolInputError) {
@@ -654,9 +708,14 @@ async function accessBrowser(request, response, id) {
   }
   const { scope, approved } = scopedAccess.load(id);
   const recipient = scope.agent === "*" ? "All current and future downstream agents" : scope.agent;
+  const permissions = scope.tools
+    ? scope.tools.includes("*") ? "All current and future MCP tools" : scope.tools.join(", ")
+    : scope.permission;
+  const resource = scope.provider === "mcp" ? "MCP connector" : scope.resource;
   return page(response, 200, `<h1>Review integration access</h1>
     <dl><dt>Agent</dt><dd>${markup(recipient)}</dd><dt>Connection</dt><dd>${markup(scope.label)}</dd>
-    <dt>Resource</dt><dd><code>${markup(scope.resource)}</code></dd><dt>Permissions</dt><dd>${markup(scope.permission)}</dd></dl>
+    <dt>Resource</dt><dd><code>${markup(resource)}</code></dd><dt>Permissions</dt><dd>${markup(permissions)}</dd></dl>
+    ${scope.destination ? `<p>Destination <code>${markup(scope.destination)}</code></p>` : ""}
     ${scope.threadPermission ? `<p>Threads under this channel have ${markup(scope.threadPermission)} access.</p>` : ""}
     ${scope.provider === "github" ? "<p>This adds a native Git grant. Administrators can review or revoke broader existing connection access separately.</p>" : ""}
     <p>Integration calls go through Luna.</p>

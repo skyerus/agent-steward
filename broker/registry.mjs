@@ -73,7 +73,7 @@ export class Registry {
 
   accessRows() {
     return this.db.prepare(`
-      SELECT id,owner_agent,
+      SELECT id,revision,owner_agent,
         EXISTS(SELECT 1 FROM connection_grants WHERE connection=id AND agent=owner_agent) AS owner_active,
         EXISTS(SELECT 1 FROM connection_grants WHERE connection=id AND agent IS NOT owner_agent) AS shared
       FROM connections WHERE deleted=0`

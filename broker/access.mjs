@@ -23,9 +23,10 @@ export function validActor(actor) {
 }
 
 export class Access {
-  constructor(registry, isAdmin) {
+  constructor(registry, isAdmin, isScopedShared = () => false) {
     this.registry = registry;
     this.isAdmin = isAdmin;
+    this.isScopedShared = isScopedShared;
   }
 
   async snapshot(actor) {
@@ -35,7 +36,9 @@ export class Access {
       for (const action of ["manage", "share", "agents"]) policies.push([adminAgent, actor.user, "*", action]);
     }
     for (const row of this.registry.accessRows()) {
-      if (row.owner_active && !row.shared) policies.push([row.owner_agent, "*", row.id, "manage"]);
+      if (row.owner_active && !row.shared && !this.isScopedShared(row)) {
+        policies.push([row.owner_agent, "*", row.id, "manage"]);
+      }
     }
     for (const grant of this.registry.grants()) {
       policies.push([grant.agent, "*", grant.connection, "use"]);
